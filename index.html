@@ -4008,6 +4008,73 @@
             }
         }
         /* ============================================================
+           MOBILE PERFORMANCE — kill GPU-heavy backdrop blur
+           ------------------------------------------------------------
+           Every blurred element costs 3-8 ms per frame on a mid-range
+           Android. This many stacked blurs pushed the phone to 30 fps
+           or worse. Desktop keeps the glass look; mobile gets a plain
+           rgba background, which is visually very close and free.
+           ============================================================ */
+        @media (max-width: 900px) {
+            .mobile-nav,
+            .login-form-modal,
+            .login-form-modal-content,
+            .about-us-modal,
+            .about-us-modal-content,
+            .about-us-modal-content .compact-header,
+            .admin-dashboard,
+            .admin-header,
+            .access-modal-overlay,
+            .access-modal-sheet,
+            .speed-modal-overlay,
+            .speed-modal,
+            .micro-modal,
+            .session-indicator,
+            .pwa-install-banner,
+            .date-time-footer > div,
+            .video-controls-container,
+            .change-media-btn,
+            .media-header,
+            .city-slide-mute-btn,
+            .speed-trigger,
+            .login-card,
+            .compact-card,
+            .wf-back-btn,
+            .close-login-modal,
+            .close-about-us-modal,
+            .admin-close-btn,
+            .video-control-btn,
+            .micro-close,
+            .admin-circle,
+            .admin-preview-box,
+            .social-link-icon {
+                backdrop-filter: none !important;
+                -webkit-backdrop-filter: none !important;
+            }
+
+            /* Keep the container readable with a plain, opaque-ish tint
+               so removing the blur does not make text hard to read. */
+            .mobile-nav { background: rgba(10, 14, 23, 0.99) !important; }
+            .login-form-modal,
+            .about-us-modal,
+            .admin-dashboard { background: rgba(0, 0, 0, 0.94) !important; }
+            .video-controls-container { background: rgba(0, 0, 0, 0.85) !important; }
+            .date-time-footer > div { background: rgba(0, 0, 0, 0.72) !important; }
+
+            /* Promote scrolling containers to their own compositor layer
+               so scrolling never repaints the whole page. */
+            .about-us-modal-content,
+            .login-form-modal-content,
+            .admin-content,
+            .platforms-grid,
+            .city-slideshow,
+            .background-slideshow-container {
+                transform: translateZ(0);
+                will-change: scroll-position;
+            }
+        }
+
+        /* ============================================================
            MOBILE MEDIA QUERIES
            ============================================================ */
         @media (max-width: 900px) {
@@ -7312,8 +7379,12 @@
         async function saveUserVideo(email, videoId, videoBlob) {
             if (!email || !videoBlob) return { ok: false, reason: 'missing_input', size: 0 };
 
-            // Session memory mirror — instant playback, cleared on reload
-            try { __userVideoMemoryMirror.set(email + '::' + videoId, videoBlob); } catch (e) { }
+            // NOTE: The in-memory Blob mirror was removed. Holding a 1.5 GB
+            // Blob in JavaScript RAM forced the phone's OS to swap, which
+            // caused the tap delay and stutter on mobile. The blob is still
+            // written to IndexedDB below, which survives refresh exactly
+            // the same way it did before. IndexedDB hands back a Blob
+            // reference (not the bytes), so reads are still fast.
 
             const mime = (videoBlob.type && videoBlob.type !== 'application/octet-stream')
                 ? videoBlob.type
@@ -7429,10 +7500,8 @@
             return { ok: false, reason: idbError || 'write_failed', size };
         }
 
-        // In-memory mirror for the current session — covers the case where
-        // IndexedDB is slow, blocked, or evicted mid-session. Cleared on
-        // page reload (by design — IndexedDB is the durable store).
-        const __userVideoMemoryMirror = new Map();
+        // In-memory mirror removed — it forced mobile RAM to swap for
+        // large videos. IndexedDB is the durable store and is fast enough.
 
         // ============================================================
         // VIDEO READ — DIRECT BLOB FROM INDEXEDDB
@@ -7452,16 +7521,12 @@
             if (!email) return null;
 
             // ---------------------------------------------------------
-            // 1. Session memory — same page load only
+            // Session memory mirror removed — see saveUserVideo().
+            // Straight to IndexedDB, which is the durable store.
             // ---------------------------------------------------------
-            const memKey = email + '::' + videoId;
-            if (__userVideoMemoryMirror.has(memKey)) {
-                const cached = __userVideoMemoryMirror.get(memKey);
-                if (cached instanceof Blob) return cached;
-            }
 
             // ---------------------------------------------------------
-            // 2. Direct Blob from IndexedDB — the durable fast path.
+            // Direct Blob from IndexedDB — the durable fast path.
             //    For a 3 GB video this returns in milliseconds because
             //    IndexedDB hands back a Blob reference, not the bytes.
             // ---------------------------------------------------------
@@ -10708,11 +10773,9 @@
             if (mediaVideo) mediaVideo.pause();
             clearVideoPosition();
 
-            // Clear ONLY the in-memory mirror. The localStorage + IndexedDB
-            // copies stay so the same user sees their video after logging
-            // back in — they are keyed per email, so they never leak to
-            // another user account.
-            try { __userVideoMemoryMirror.clear(); } catch (e) { }
+            // The localStorage + IndexedDB copies stay so the same user
+            // sees their video after logging back in — they are keyed per
+            // email, so they never leak to another user account.
 
             if (currentUserEmail) trackLoginEvent(currentUserEmail, 'logout', {});
 
@@ -11533,7 +11596,44 @@
             } catch (e) { return null; }
         }
 
+        // ------------------------------------------------------------
+        // saveSlideSnapshot() writes to sessionStorage, localStorage AND
+        // IndexedDB. On a mobile with a long slide list, the JSON.stringify
+        // of that array can take 100-300 ms. Calling it on every slideshow
+        // tick was a major source of scroll stutter.
+        //
+        // This debouncer coalesces rapid calls into ONE write every 5s on
+        // mobile (and stays immediate on desktop). Refresh survival is
+        // preserved because a snapshot is still written within 5s of any
+        // change, and the very first call fires immediately.
+        // ------------------------------------------------------------
+        let __wfSnapshotDebounceTimer = null;
+        let __wfSnapshotFirstCallDone = false;
+
         function saveSlideSnapshot() {
+            const __isMobile = window.matchMedia('(max-width: 900px)').matches;
+
+            // Desktop: write immediately, exactly as before.
+            if (!__isMobile) {
+                return __wfSnapshotWriteNow();
+            }
+
+            // Mobile: first call writes immediately so a fast refresh
+            // right after load still finds a snapshot on disk.
+            if (!__wfSnapshotFirstCallDone) {
+                __wfSnapshotFirstCallDone = true;
+                return __wfSnapshotWriteNow();
+            }
+
+            // Mobile: coalesce everything else into one write every 5s.
+            if (__wfSnapshotDebounceTimer) return;
+            __wfSnapshotDebounceTimer = setTimeout(() => {
+                __wfSnapshotDebounceTimer = null;
+                try { __wfSnapshotWriteNow(); } catch (e) { }
+            }, 5000);
+        }
+
+        function __wfSnapshotWriteNow() {
             try {
                 const mergeForSnapshot = (userList, defaultList) => {
                     const out = [];
@@ -13400,7 +13500,14 @@
                 timeInfo.textContent = now.toLocaleDateString("en-US", options);
             }
             updateTime();
-            setInterval(updateTime, 1000);
+            // 1s on modern devices, 30s on devices older than ~2018 so the
+            // clock does not wake the CPU 60x per minute. The clock stays
+            // accurate to within half a minute.
+            const __ua = navigator.userAgent || '';
+            const __isOldDevice = /Android [1-7]\./.test(__ua) ||
+                                  /iPhone OS [1-9]_/.test(__ua) ||
+                                  /iPhone OS 1[0-1]_/.test(__ua);
+            setInterval(updateTime, __isOldDevice ? 30000 : 1000);
 
             if (!navigator.geolocation) {
                 setLocationHTML("ke", "Kenya");
@@ -13820,6 +13927,7 @@
             document.getElementById("nextArrowBtn")?.addEventListener("click", function () {
                 document.getElementById("mainDashboard").style.display = "none";
                 document.getElementById("williamDashboard").style.display = "flex";
+                document.body.classList.remove('on-login');
                 setMobileMenuVisibility();
 
                 // Re-pull the user's saved image/video from local storage
@@ -13845,6 +13953,7 @@
             });
 
             document.getElementById("backToLoginBtnMain")?.addEventListener("click", function () {
+                document.body.classList.add('on-login');
                 saveVideoPosition();
                 const v = document.getElementById("mediaVideo");
                 if (v) {
@@ -13872,6 +13981,7 @@
         // ------------------------------------------------------------
         function initWilliamDashboard() {
             document.getElementById("nextArrowBtnWilliam")?.addEventListener("click", function () {
+                document.body.classList.remove('on-login');
                 saveVideoPosition();
                 const v = document.getElementById("mediaVideo");
                 if (v) {
@@ -14938,37 +15048,10 @@
                     await loadUserMedia(currentUserEmail);
                 } catch (e) { }
 
-                // Warm the video Blob cache in the background so that
-                // tapping "Continue" (into the William dashboard) shows
-                // the video instantly. We read the Blob from IndexedDB
-                // directly — no base64 decode, no RAM blow-up.
-                (async () => {
-                    try {
-                        const db = await initUserStorageDB(currentUserEmail);
-                        const tx = db.transaction([USER_VIDEOS_STORE], "readonly");
-                        const store = tx.objectStore(USER_VIDEOS_STORE);
-                        const request = store.get("william_dashboard_video");
-                        const record = await new Promise((resolve) => {
-                            request.onsuccess = () => resolve(request.result || null);
-                            request.onerror = () => resolve(null);
-                        });
-                        if (record && record.kind === 'blob' && record.blob instanceof Blob) {
-                            __wfGetCachedVideoUrl(record.blob);
-                        }
-                    } catch (e) { }
-
-                    // Small-file fallback (< 4 MB) via the localStorage mirror
-                    try {
-                        const raw = localStorage.getItem('wf_user_video_mirror_' + currentUserEmail);
-                        if (raw) {
-                            const parsed = JSON.parse(raw);
-                            if (parsed && parsed.data && typeof parsed.data === 'string' && parsed.data.length > 32) {
-                                const blob = await __wfBlobFromDataUrlSmall(parsed.data, parsed.mime);
-                                if (blob) __wfGetCachedVideoUrl(blob);
-                            }
-                        }
-                    } catch (e) { }
-                })();
+                // Boot prewarm of the video Blob cache removed. It duplicated
+                // the IndexedDB read that loadUserMedia() already performs,
+                // and it forced an early IndexedDB open on every cold boot,
+                // which is what made the first tap lag on older phones.
             }
 
             // 10. Initial mobile menu visibility
@@ -15006,10 +15089,13 @@
                 ? requestIdleCallback
                 : (fn) => setTimeout(fn, 1);
 
-            // 10a. Prewarm config cache from cloud
-            idle(() => {
-                prewarmConfigCache().catch(() => { });
-            });
+            // 10a. Prewarm config cache from cloud — deferred so the page
+            //      becomes tappable immediately on slow phones.
+            setTimeout(() => {
+                idle(() => {
+                    prewarmConfigCache().catch(() => { });
+                });
+            }, 1500);
 
             // 10b. Paint the slideshow ONCE from whatever is loaded.
             //
@@ -15037,7 +15123,10 @@
             // Persist immediately so the IndexedDB snapshot is fresh
             saveSlideSnapshot();
 
-            // Background: fetch cloud branding + slides WITHOUT blocking
+            // Background: fetch cloud branding + slides WITHOUT blocking.
+            // Deferred 1500 ms so the first paint + first tap are free
+            // of any IndexedDB / Supabase work on older phones.
+            setTimeout(() => {
             Promise.allSettled([
                 loadGlobalDefaultSlides(),
                 loadBrandingFromSupabase(),
@@ -15061,19 +15150,25 @@
 
                 saveSlideSnapshot();
             }).catch(() => { });
+            }, 1500);
 
-            // 10c. Realtime sync (replace-not-append, echo-guarded)
-            idle(() => {
-                initRealtimeSync();
-            });
+            // 10c. Realtime sync (replace-not-append, echo-guarded) — deferred
+            setTimeout(() => {
+                idle(() => {
+                    initRealtimeSync();
+                });
+            }, 2500);
 
             // 10d. Auto-hide buttons
             idle(() => {
                 initAutoHideAllButtons();
             });
 
-            // 10e. Instant admin user snapshot on page load
-            idle(() => {
+            // 10e. Instant admin user snapshot on page load — deferred further
+            //      because it opens an extra Supabase query that is not needed
+            //      for first paint.
+            setTimeout(() => {
+                idle(() => {
                 if (typeof window.__instantAdminPull !== 'function') {
                     window.__instantAdminPull = true;
                     setTimeout(async () => {
@@ -15123,7 +15218,8 @@
                         } catch (e) { }
                     }, 1200);
                 }
-            });
+                });
+            }, 3000);
 
             // 10e-2. Force instant scroll on the About Us modal.
             // Clears any inline touch-action / overscroll style that an
@@ -15344,14 +15440,25 @@
             document.addEventListener('visibilitychange', enforceAdminCircleVisibility);
 
             function observeDashboards() {
+                // On mobile, a MutationObserver watching 'style' on three
+                // dashboards fires on every inline style change and is a
+                // real source of jank. The on-login class is now updated
+                // from the navigation paths directly (show/hide calls),
+                // which is where it actually matters.
+                if (window.matchMedia('(max-width: 900px)').matches) return;
+
                 const loginDash = document.getElementById('loginDashboard');
                 const mainDash = document.getElementById('mainDashboard');
                 const williamDash = document.getElementById('williamDashboard');
                 const targets = [loginDash, mainDash, williamDash].filter(Boolean);
                 if (targets.length === 0) return;
+                let __last = null;
                 const mo = new MutationObserver(() => {
-                    enforceAdminCircleVisibility();
                     const isOnSlides = loginDash && loginDash.style.display !== 'none';
+                    // Only touch the DOM when the value actually changed.
+                    if (__last === isOnSlides) return;
+                    __last = isOnSlides;
+                    enforceAdminCircleVisibility();
                     if (isOnSlides) document.body.classList.add('on-login');
                     else document.body.classList.remove('on-login');
                 });
@@ -15465,7 +15572,13 @@
 
                 let __wfTickTimer = null;
                 const tick = () => {
+                    // Skip when the tab is hidden — old phones burn battery
+                    // and CPU on background work that nobody sees.
+                    if (document.hidden) return;
                     if (wfAnyModalOpen()) return;
+                    // Skip while the user's finger is down — never compete
+                    // with a scroll gesture on a slow phone.
+                    if (typeof window.__wfTouchBusy === 'function' && window.__wfTouchBusy()) return;
                     enforceAdminCircleVisibility();
                     enforceStickyNavPosition();
                     cleanupFirstPaintBG();
@@ -15475,7 +15588,10 @@
                 // resumed when it closes, so no tick can ever land mid-gesture.
                 const startTicks = () => {
                     if (__wfTickTimer) return;
-                    __wfTickTimer = setInterval(tick, 3500);
+                    // 3.5s on desktop, 8s on mobile. The circle visibility
+                    // and sticky nav position do not need sub-second updates.
+                    const __interval = window.matchMedia('(max-width: 900px)').matches ? 8000 : 3500;
+                    __wfTickTimer = setInterval(tick, __interval);
                 };
                 const stopTicks = () => {
                     if (__wfTickTimer) { clearInterval(__wfTickTimer); __wfTickTimer = null; }
